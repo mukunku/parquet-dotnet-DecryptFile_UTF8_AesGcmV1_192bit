@@ -66,7 +66,6 @@ namespace Parquet.File {
         /// <returns>DataColumn object filled in with data</returns>
         /// <exception cref="NotSupportedException">Unsupported page type</exception>
         public async Task<DataColumn> ReadAsync(CancellationToken cancellationToken = default) {
-
             // how many values are in column chunk, as there may be multiple data pages
             int totalValuesInChunk = (int)_thriftColumnChunk.MetaData!.NumValues;
             int definedValuesCount = totalValuesInChunk;
@@ -74,10 +73,13 @@ namespace Parquet.File {
                 definedValuesCount -= (int)_stats.NullCount.Value;
             using var pc = new PackedColumn(_dataField, totalValuesInChunk, definedValuesCount);
             long fileOffset = GetFileOffset();
-            _inputStream.Seek(fileOffset, SeekOrigin.Begin);
+            long pageOffset = fileOffset;
 
             while(pc.ValuesRead < totalValuesInChunk) {
+                // use absolute positioning on every page read, because in some edge cases page reader may not exhaust or over-read page data
+                _inputStream.Seek(pageOffset, SeekOrigin.Begin);
                 PageHeader ph = PageHeader.Read(new ThriftCompactProtocolReader(_inputStream));
+                pageOffset = _inputStream.Position + ph.CompressedPageSize;
 
                 switch(ph.Type) {
                     case PageType.DICTIONARY_PAGE:
@@ -127,8 +129,9 @@ namespace Parquet.File {
             // get the minimum offset, we'll just read pages in sequence as DictionaryPageOffset/Data_page_offset are not reliable
             new[]
                 {
-                    _thriftColumnChunk.MetaData?.DictionaryPageOffset ?? 0,
-                    _thriftColumnChunk.MetaData!.DataPageOffset
+                _thriftColumnChunk.MetaData?.DictionaryPageOffset ?? 0,
+                _thriftColumnChunk.MetaData!.DataPageOffset,
+                _thriftColumnChunk.MetaData?.IndexPageOffset ?? 0
                 }
                 .Where(e => e != 0)
                 .Min();
@@ -180,8 +183,8 @@ namespace Parquet.File {
                 throw new ParquetException($"column '{_dataField.Path}' is missing data page header, file is corrupt");
             }
 
-            using MemoryOwner<byte> pageMemory = MemoryOwner<byte>.Allocate(ph.CompressedPageSize);
-            using(Stream src = _inputStream.Sub(_inputStream.Position, ph.CompressedPageSize)) {
+            using var pageMemory = MemoryOwner<byte>.Allocate(ph.CompressedPageSize);
+            await using(Stream src = _inputStream.Sub(_inputStream.Position, ph.CompressedPageSize)) {
                 await src.CopyToAsync(pageMemory.Memory);
             }
             int dataUsed = 0;
