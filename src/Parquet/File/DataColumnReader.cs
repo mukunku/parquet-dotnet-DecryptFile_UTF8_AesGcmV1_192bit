@@ -2,6 +2,7 @@
 using System.Buffers;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using CommunityToolkit.HighPerformance.Buffers;
@@ -280,7 +281,9 @@ class DataColumnReader {
                 break;
 
             case Encoding.DELTA_BINARY_PACKED: {// 5
-                    int read = DeltaBinaryPackedEncoder.Decode(src, rc.ValuesToReadInto, totalValuesInPage, out _);
+                    int read = DeltaBinaryPackedEncoder.IsSupported(typeof(T))
+                        ? DeltaBinaryPackedEncoder.Decode(src, rc.ValuesToReadInto, totalValuesInPage, out _)
+                        : DecodeDeltaBinaryPackedViaPlain(src, rc.ValuesToReadInto, totalValuesInPage);
                     rc.MarkValuesRead(read);
                 }
                 break;
@@ -305,6 +308,43 @@ class DataColumnReader {
             case Encoding.BIT_PACKED:                // 4 (deprecated)
             default:
                 throw new ParquetException($"encoding {encoding} is not supported.");
+        }
+    }
+
+    /// <summary>
+    /// Handles DELTA_BINARY_PACKED columns whose CLR type is a logical type over INT32/INT64
+    /// (DateTime, DateOnly, TimeOnly, TimeSpan, decimal, etc.). Values are delta-decoded into their
+    /// physical representation, then reinterpreted as PLAIN bytes so the plain decoder applies the
+    /// exact same logical-type conversion it uses for PLAIN-encoded pages.
+    /// </summary>
+    private int DecodeDeltaBinaryPackedViaPlain<T>(Span<byte> src, Span<T> dest, int totalValuesInPage)
+        where T : struct {
+        switch(_schemaElement!.Type) {
+            case Meta.Type.INT32: {
+                    int[] buf = ArrayPool<int>.Shared.Rent(totalValuesInPage);
+                    try {
+                        int n = DeltaBinaryPackedEncoder.Decode(src, buf.AsSpan(), totalValuesInPage, out _);
+                        ParquetPlainEncoder.Decode(dest, n, _schemaElement,
+                            MemoryMarshal.AsBytes(buf.AsSpan(0, n)), out int read);
+                        return read;
+                    } finally {
+                        ArrayPool<int>.Shared.Return(buf);
+                    }
+                }
+            case Meta.Type.INT64: {
+                    long[] buf = ArrayPool<long>.Shared.Rent(totalValuesInPage);
+                    try {
+                        int n = DeltaBinaryPackedEncoder.Decode(src, buf.AsSpan(), totalValuesInPage, out _);
+                        ParquetPlainEncoder.Decode(dest, n, _schemaElement,
+                            MemoryMarshal.AsBytes(buf.AsSpan(0, n)), out int read);
+                        return read;
+                    } finally {
+                        ArrayPool<long>.Shared.Return(buf);
+                    }
+                }
+            default:
+                throw new ParquetException(
+                    $"{Encoding.DELTA_BINARY_PACKED} is only valid for {Meta.Type.INT32} and {Meta.Type.INT64}, but column '{_dataField.Path}' has physical type {_schemaElement.Type}");
         }
     }
 
